@@ -188,4 +188,119 @@ would be then able to access the data behind the same pointer.
 .. [#f6] https://docs.python.org/3/extending/extending.html#using-capsules
 
 Module Destructors
-====
+==================
+
+pybind11 does not provide an explicit mechanism to invoke cleanup code at
+module destruction time. In rare cases where such functionality is required, it
+is possible to emulate it using Python capsules or weak references with a
+destruction callback.
+
+.. code-block:: cpp
+
+    auto cleanup_callback = []() {
+        // perform cleanup here -- this function is called with the GIL held
+    };
+
+    m.add_object("_cleanup", py::capsule(cleanup_callback));
+
+This approach has the potential downside that instances of classes exposed
+within the module may still be alive when the cleanup callback is invoked
+(whether this is acceptable will generally depend on the application).
+
+Alternatively, the capsule may also be stashed within a type object, which
+ensures that it not called before all instances of that type have been
+collected:
+
+.. code-block:: cpp
+
+    auto cleanup_callback = []() { /* ... */ };
+    m.attr("BaseClass").attr("_cleanup") = py::capsule(cleanup_callback);
+
+Both approaches also expose a potentially dangerous ``_cleanup`` attribute in
+Python, which may be undesirable from an API standpoint (a premature explicit
+call from Python might lead to undefined behavior). Yet another approach that 
+avoids this issue involves weak reference with a cleanup callback:
+
+.. code-block:: cpp
+
+    // Register a callback function that is invoked when the BaseClass object is colelcted
+    py::cpp_function cleanup_callback(
+        [](py::handle weakref) {
+            // perform cleanup here -- this function is called with the GIL held
+
+            weakref.dec_ref(); // release weak reference
+        }
+    );
+
+    // Create a weak reference with a cleanup callback and initially leak it
+    (void) py::weakref(m.attr("BaseClass"), cleanup_callback).release();
+
+.. note::
+
+    PyPy (at least version 5.9) does not garbage collect objects when the
+    interpreter exits. An alternative approach (which also works on CPython) is to use
+    the :py:mod:`atexit` module [#f7]_, for example:
+
+    .. code-block:: cpp
+
+        auto atexit = py::module::import("atexit");
+        atexit.attr("register")(py::cpp_function([]() {
+            // perform cleanup here -- this function is called with the GIL held
+        }));
+
+    .. [#f7] https://docs.python.org/3/library/atexit.html
+
+
+Generating documentation using Sphinx
+=====================================
+
+Sphinx [#f4]_ has the ability to inspect the signatures and documentation
+strings in pybind11-based extension modules to automatically generate beautiful
+documentation in a variety formats. The python_example repository [#f5]_ contains a
+simple example repository which uses this approach.
+
+There are two potential gotchas when using this approach: first, make sure that
+the resulting strings do not contain any :kbd:`TAB` characters, which break the
+docstring parsing routines. You may want to use C++11 raw string literals,
+which are convenient for multi-line comments. Conveniently, any excess
+indentation will be automatically be removed by Sphinx. However, for this to
+work, it is important that all lines are indented consistently, i.e.:
+
+.. code-block:: cpp
+
+    // ok
+    m.def("foo", &foo, R"mydelimiter(
+        The foo function
+
+        Parameters
+        ----------
+    )mydelimiter");
+
+    // *not ok*
+    m.def("foo", &foo, R"mydelimiter(The foo function
+
+        Parameters
+        ----------
+    )mydelimiter");
+
+By default, pybind11 automatically generates and prepends a signature to the docstring of a function 
+registered with ``module::def()`` and ``class_::def()``. Sometimes this
+behavior is not desirable, because you want to provide your own signature or remove 
+the docstring completely to exclude the function from the Sphinx documentation.
+The class ``options`` allows you to selectively suppress auto-generated signatures:
+
+.. code-block:: cpp
+
+    PYBIND11_MODULE(example, m) {
+        py::options options;
+        options.disable_function_signatures();
+
+        m.def("add", [](int a, int b) { return a + b; }, "A function which adds two numbers");
+    }
+
+Note that changes to the settings affect only function bindings created during the 
+lifetime of the ``options`` instance. When it goes out of scope at the end of the module's init function, 
+the default settings are restored to prevent unwanted side effects.
+
+.. [#f4] http://www.sphinx-doc.org
+.. [#f5] http://github.com/pybind/python_example
