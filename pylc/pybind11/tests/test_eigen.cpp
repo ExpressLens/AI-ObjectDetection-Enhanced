@@ -280,4 +280,50 @@ TEST_SUBMODULE(eigen, m) {
     // that would allow copying (if types or strides don't match) for comparison:
     m.def("get_elem", &get_elem);
     // Now this alternative that calls the tells pybind to fail rather than copy:
-    
+    m.def("get_elem_nocopy", [](Eigen::Ref<const Eigen::MatrixXd> m) -> double { return get_elem(m); },
+            py::arg().noconvert());
+    // Also test a row-major-only no-copy const ref:
+    m.def("get_elem_rm_nocopy", [](Eigen::Ref<const Eigen::Matrix<long, -1, -1, Eigen::RowMajor>> &m) -> long { return m(2, 1); },
+            py::arg().noconvert());
+
+    // test_issue738
+    // Issue #738: 1xN or Nx1 2D matrices were neither accepted nor properly copied with an
+    // incompatible stride value on the length-1 dimension--but that should be allowed (without
+    // requiring a copy!) because the stride value can be safely ignored on a size-1 dimension.
+    m.def("iss738_f1", &adjust_matrix<const Eigen::Ref<const Eigen::MatrixXd> &>, py::arg().noconvert());
+    m.def("iss738_f2", &adjust_matrix<const Eigen::Ref<const Eigen::Matrix<double, -1, -1, Eigen::RowMajor>> &>, py::arg().noconvert());
+
+    // test_issue1105
+    // Issue #1105: when converting from a numpy two-dimensional (Nx1) or (1xN) value into a dense
+    // eigen Vector or RowVector, the argument would fail to load because the numpy copy would fail:
+    // numpy won't broadcast a Nx1 into a 1-dimensional vector.
+    m.def("iss1105_col", [](Eigen::VectorXd) { return true; });
+    m.def("iss1105_row", [](Eigen::RowVectorXd) { return true; });
+
+    // test_named_arguments
+    // Make sure named arguments are working properly:
+    m.def("matrix_multiply", [](const py::EigenDRef<const Eigen::MatrixXd> A, const py::EigenDRef<const Eigen::MatrixXd> B)
+            -> Eigen::MatrixXd {
+        if (A.cols() != B.rows()) throw std::domain_error("Nonconformable matrices!");
+        return A * B;
+    }, py::arg("A"), py::arg("B"));
+
+    // test_custom_operator_new
+    py::class_<CustomOperatorNew>(m, "CustomOperatorNew")
+        .def(py::init<>())
+        .def_readonly("a", &CustomOperatorNew::a)
+        .def_readonly("b", &CustomOperatorNew::b);
+
+    // test_eigen_ref_life_support
+    // In case of a failure (the caster's temp array does not live long enough), creating
+    // a new array (np.ones(10)) increases the chances that the temp array will be garbage
+    // collected and/or that its memory will be overridden with different values.
+    m.def("get_elem_direct", [](Eigen::Ref<const Eigen::VectorXd> v) {
+        py::module::import("numpy").attr("ones")(10);
+        return v(5);
+    });
+    m.def("get_elem_indirect", [](std::vector<Eigen::Ref<const Eigen::VectorXd>> v) {
+        py::module::import("numpy").attr("ones")(10);
+        return v[0](5);
+    });
+}
