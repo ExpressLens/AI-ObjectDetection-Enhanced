@@ -1348,4 +1348,137 @@ public:
         buf.readonly = info.readonly;
         buf.internal = nullptr;
 
-      
+        m_ptr = PyMemoryView_FromBuffer(&buf);
+        if (!m_ptr)
+            pybind11_fail("Unable to create memoryview from buffer descriptor");
+    }
+
+    PYBIND11_OBJECT_CVT(memoryview, object, PyMemoryView_Check, PyMemoryView_FromObject)
+};
+/// @} pytypes
+
+/// \addtogroup python_builtins
+/// @{
+inline size_t len(handle h) {
+    ssize_t result = PyObject_Length(h.ptr());
+    if (result < 0)
+        pybind11_fail("Unable to compute length of object");
+    return (size_t) result;
+}
+
+inline size_t len_hint(handle h) {
+#if PY_VERSION_HEX >= 0x03040000
+    ssize_t result = PyObject_LengthHint(h.ptr(), 0);
+#else
+    ssize_t result = PyObject_Length(h.ptr());
+#endif
+    if (result < 0) {
+        // Sometimes a length can't be determined at all (eg generators)
+        // In which case simply return 0
+        PyErr_Clear();
+        return 0;
+    }
+    return (size_t) result;
+}
+
+inline str repr(handle h) {
+    PyObject *str_value = PyObject_Repr(h.ptr());
+    if (!str_value) throw error_already_set();
+#if PY_MAJOR_VERSION < 3
+    PyObject *unicode = PyUnicode_FromEncodedObject(str_value, "utf-8", nullptr);
+    Py_XDECREF(str_value); str_value = unicode;
+    if (!str_value) throw error_already_set();
+#endif
+    return reinterpret_steal<str>(str_value);
+}
+
+inline iterator iter(handle obj) {
+    PyObject *result = PyObject_GetIter(obj.ptr());
+    if (!result) { throw error_already_set(); }
+    return reinterpret_steal<iterator>(result);
+}
+/// @} python_builtins
+
+NAMESPACE_BEGIN(detail)
+template <typename D> iterator object_api<D>::begin() const { return iter(derived()); }
+template <typename D> iterator object_api<D>::end() const { return iterator::sentinel(); }
+template <typename D> item_accessor object_api<D>::operator[](handle key) const {
+    return {derived(), reinterpret_borrow<object>(key)};
+}
+template <typename D> item_accessor object_api<D>::operator[](const char *key) const {
+    return {derived(), pybind11::str(key)};
+}
+template <typename D> obj_attr_accessor object_api<D>::attr(handle key) const {
+    return {derived(), reinterpret_borrow<object>(key)};
+}
+template <typename D> str_attr_accessor object_api<D>::attr(const char *key) const {
+    return {derived(), key};
+}
+template <typename D> args_proxy object_api<D>::operator*() const {
+    return args_proxy(derived().ptr());
+}
+template <typename D> template <typename T> bool object_api<D>::contains(T &&item) const {
+    return attr("__contains__")(std::forward<T>(item)).template cast<bool>();
+}
+
+template <typename D>
+pybind11::str object_api<D>::str() const { return pybind11::str(derived()); }
+
+template <typename D>
+str_attr_accessor object_api<D>::doc() const { return attr("__doc__"); }
+
+template <typename D>
+handle object_api<D>::get_type() const { return (PyObject *) Py_TYPE(derived().ptr()); }
+
+template <typename D>
+bool object_api<D>::rich_compare(object_api const &other, int value) const {
+    int rv = PyObject_RichCompareBool(derived().ptr(), other.derived().ptr(), value);
+    if (rv == -1)
+        throw error_already_set();
+    return rv == 1;
+}
+
+#define PYBIND11_MATH_OPERATOR_UNARY(op, fn)                                   \
+    template <typename D> object object_api<D>::op() const {                   \
+        object result = reinterpret_steal<object>(fn(derived().ptr()));        \
+        if (!result.ptr())                                                     \
+            throw error_already_set();                                         \
+        return result;                                                         \
+    }
+
+#define PYBIND11_MATH_OPERATOR_BINARY(op, fn)                                  \
+    template <typename D>                                                      \
+    object object_api<D>::op(object_api const &other) const {                  \
+        object result = reinterpret_steal<object>(                             \
+            fn(derived().ptr(), other.derived().ptr()));                       \
+        if (!result.ptr())                                                     \
+            throw error_already_set();                                         \
+        return result;                                                         \
+    }
+
+PYBIND11_MATH_OPERATOR_UNARY (operator~,   PyNumber_Invert)
+PYBIND11_MATH_OPERATOR_UNARY (operator-,   PyNumber_Negative)
+PYBIND11_MATH_OPERATOR_BINARY(operator+,   PyNumber_Add)
+PYBIND11_MATH_OPERATOR_BINARY(operator+=,  PyNumber_InPlaceAdd)
+PYBIND11_MATH_OPERATOR_BINARY(operator-,   PyNumber_Subtract)
+PYBIND11_MATH_OPERATOR_BINARY(operator-=,  PyNumber_InPlaceSubtract)
+PYBIND11_MATH_OPERATOR_BINARY(operator*,   PyNumber_Multiply)
+PYBIND11_MATH_OPERATOR_BINARY(operator*=,  PyNumber_InPlaceMultiply)
+PYBIND11_MATH_OPERATOR_BINARY(operator/,   PyNumber_TrueDivide)
+PYBIND11_MATH_OPERATOR_BINARY(operator/=,  PyNumber_InPlaceTrueDivide)
+PYBIND11_MATH_OPERATOR_BINARY(operator|,   PyNumber_Or)
+PYBIND11_MATH_OPERATOR_BINARY(operator|=,  PyNumber_InPlaceOr)
+PYBIND11_MATH_OPERATOR_BINARY(operator&,   PyNumber_And)
+PYBIND11_MATH_OPERATOR_BINARY(operator&=,  PyNumber_InPlaceAnd)
+PYBIND11_MATH_OPERATOR_BINARY(operator^,   PyNumber_Xor)
+PYBIND11_MATH_OPERATOR_BINARY(operator^=,  PyNumber_InPlaceXor)
+PYBIND11_MATH_OPERATOR_BINARY(operator<<,  PyNumber_Lshift)
+PYBIND11_MATH_OPERATOR_BINARY(operator<<=, PyNumber_InPlaceLshift)
+PYBIND11_MATH_OPERATOR_BINARY(operator>>,  PyNumber_Rshift)
+PYBIND11_MATH_OPERATOR_BINARY(operator>>=, PyNumber_InPlaceRshift)
+
+#undef PYBIND11_MATH_OPERATOR_UNARY
+#undef PYBIND11_MATH_OPERATOR_BINARY
+
+NAMESPACE_END(detail)
+NAMESPACE_END(PYBIND11_NAMESPACE)
