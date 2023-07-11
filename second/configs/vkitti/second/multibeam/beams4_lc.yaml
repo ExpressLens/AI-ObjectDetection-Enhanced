@@ -139,7 +139,7 @@ train_input_reader: {
   cum_lc_wrapper: {
     lc_policy: "DPOptimizedPolicy"
     lc_horizon: 3
-    init_lidar_num_beams: 2
+    init_lidar_num_beams: 4
     sparsify_return: {
       max_height: 2.00  # car bbox height is 1.56m
       pos_intensity_thresh: 50  # max intensity is 255
@@ -197,7 +197,7 @@ valid_input_reader: {
   cum_lc_wrapper: {
     lc_policy: "DPOptimizedPolicy"
     lc_horizon: 3
-    init_lidar_num_beams: 2
+    init_lidar_num_beams: 4
     sparsify_return: {
       max_height: 2.00  # car bbox height is 1.56m
       pos_intensity_thresh: 50  # max intensity is 255
@@ -224,7 +224,7 @@ eval_input_reader: {
   cum_lc_wrapper: {
     lc_policy: "DPOptimizedPolicy"
     lc_horizon: 3
-    init_lidar_num_beams: 2
+    init_lidar_num_beams: 4
     sparsify_return: {
       max_height: 2.00  # car bbox height is 1.56m
       pos_intensity_thresh: 50  # max intensity is 255
