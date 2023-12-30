@@ -971,4 +971,619 @@ class KittiViewer(QMainWindow):
             self.warning("detection path contain nothing.")
             return
         self.detection_annos = dt_annos
+        self.info(f"load {len(dt_annos)} detections.")
+        self.json_setting.set("latest_det_path", det_path)
+        annos = kitti.filter_empty_annos(self.detection_annos)
+        self.dt_image_idxes = [anno["image_idx"][0] for anno in annos]
+        # get class in dt
+        available_cls = []
+        for anno in self.detection_annos:
+            for name in anno["name"]:
+                if name not in available_cls:
+                    available_cls.append(name)
+
+        self.dt_combobox.clear()
+        self.dt_combobox.addItem("All")
+        for cls_name in available_cls:
+            self.dt_combobox.addItem(cls_name)
+
+        current_class = self.dt_combobox.currentText()
+        if current_class == "All":
+            self._current_dt_cls_ids = self.dt_image_idxes
+        else:
+            self._current_dt_cls_ids = [
+                anno["image_idx"][0] for anno in annos
+                if anno["name"] == current_class
+            ]
+        self._current_dt_cls_idx = 0
+        """
+        if self.kitti_infos is not None:
+            t = time.time()
+            gt_annos = [info["annos"] for info in self.kitti_infos]
+            self.message(get_official_eval_result(gt_annos, dt_annos, 0))
+            self.message(f"eval use time: {time.time() - t:.4f}")
+        """
+
+    def sample_to_current_data(self):
+        if self.kitti_info is None:
+            self.error("you must load infos and choose a existing image idx first.")
+            return
+
+        sampled_difficulty = []
+        # class_names = ["Car"]
+        pc_info = self.kitti_info["point_cloud"]
+        calib = self.kitti_info["calib"]
+        rect = calib['R0_rect']
+        P2 = calib['P2']
+        Trv2c = calib['Tr_velo_to_cam']
+        num_features = 4
+        if 'num_features' in pc_info:
+            num_features = pc_info['num_features']
+
+        # class_names = self.w_config.get("UsedClass")
+        # class_names_group = [["trailer", "tractor"]]
+
+        if self.db_sampler is not None:
+            # gt_boxes_mask = np.array(
+            #     [n in class_names for n in self.gt_names], dtype=np.bool_)
+            gt_boxes_mask = np.ones((self.gt_names.shape[0],), np.bool_)
+            sampled_dict = self.db_sampler.sample_all(
+                self.root_path,
+                self.gt_boxes,
+                self.gt_names,
+                num_features,
+                False,
+                gt_group_ids=self.group_ids)
+            if sampled_dict is not None:
+                sampled_gt_names = sampled_dict["gt_names"]
+                sampled_gt_boxes = sampled_dict["gt_boxes"]
+                sampled_points = sampled_dict["points"]
+                sampled_gt_masks = sampled_dict["gt_masks"]
+                sampled_difficulty = sampled_dict["difficulty"]
+                # gt_names = gt_names[gt_boxes_mask].tolist()
+                self.gt_names = np.concatenate(
+                    [self.gt_names, sampled_gt_names], axis=0)
+                # gt_names += [s["name"] for s in sampled]
+                self.gt_boxes = np.concatenate(
+                    [self.gt_boxes, sampled_gt_boxes])
+                gt_boxes_mask = np.concatenate(
+                    [gt_boxes_mask, sampled_gt_masks], axis=0)
+                self.difficulty = np.concatenate(
+                    [self.difficulty, sampled_difficulty], axis=0)
+                self.points = np.concatenate(
+                    [sampled_points, self.points], axis=0)
+                sampled_group_ids = sampled_dict["group_ids"]
+                if self.group_ids is not None:
+                    self.group_ids = np.concatenate(
+                        [self.group_ids, sampled_group_ids])
+
+            '''
+            prep.noise_per_object_(
+                self.gt_boxes,
+                self.points,
+                gt_boxes_mask,
+                rotation_perturb=[-1.57, 1.57],
+                center_noise_std=[1.0, 1.0, 1.0],
+                num_try=50)'''
+            # should remove unrelated objects after noise per object
+            self.gt_boxes = self.gt_boxes[gt_boxes_mask]
+            self.gt_names = self.gt_names[gt_boxes_mask]
+            self.difficulty = self.difficulty[gt_boxes_mask]
+            if self.group_ids is not None:
+                self.group_ids = self.group_ids[gt_boxes_mask]
+        else:
+            self.error("you enable sample but not provide a database")
+
+    def data_augmentation(self):
+        if self.kitti_info is None:
+            self.error("you must load infos and choose a existing image idx first.")
+            return
+
+        seed = np.random.randint(5000000)
+        np.random.seed(seed)
+        # seed = 1798767
+        self.info(f"prep random seed: {seed}")
+        t = time.time()
+        group_ids = None
+        if self.w_config.get("GroupNoisePerObject"):
+            group_ids = self.group_ids
+        prep.noise_per_object_v3_(
+            self.gt_boxes,
+            self.points,
+            # rotation_perturb=0.0,
+            # center_noise_std=0,
+            global_random_rot_range=[np.pi / 4, np.pi / 4 * 3],
+            # global_random_rot_range=[0, 6.28],
+            group_ids=group_ids,
+            num_try=100)
+        self.info("noise time", time.time() - t)
+        # self.gt_boxes, self.points = prep.random_flip(
+        #     self.gt_boxes, self.points)
+        # self.gt_boxes, self.points = prep.global_rotation(
+        #     self.gt_boxes, self.points)
+        # self.gt_boxes[:, 6] = box_np_ops.limit_angles(self.gt_boxes[:, 6])
+        # self.gt_boxes, self.points = prep.global_scaling(
+        #     self.gt_boxes, self.points)
+        # mask = prep.filter_gt_box_outside_range(
+        #     self.gt_boxes, [0, -40, 70.4, 40])
+        # self.gt_boxes = self.gt_boxes[mask]
+
+    def draw_gt_in_image(self):
+        if self.kitti_info is None:
+            self.error("you must load infos and choose a existing image idx first.")
+            return
+
+        calib = self.kitti_info["calib"]
+        rect = calib['R0_rect']
+        P2 = calib['P2']
+        Trv2c = calib['Tr_velo_to_cam']
+        gt_boxes_camera = box_np_ops.box_lidar_to_camera(
+            self.gt_boxes, rect, Trv2c)
+        boxes_3d = box_np_ops.center_to_corner_box3d(gt_boxes_camera[:, :3],
+                                                     gt_boxes_camera[:, 3:6],
+                                                     gt_boxes_camera[:, 6],
+                                                     origin=[0.5, 1.0, 0.5],
+                                                     axis=1)
+        boxes_3d = boxes_3d.reshape((-1, 3))
+        boxes_3d_p2 = box_np_ops.project_to_image(boxes_3d, P2)
+        boxes_3d_p2 = boxes_3d_p2.reshape([-1, 8, 2])
+        if self.current_image is not None:
+            bbox_plot.draw_3d_bbox_in_ax(
+                self.w_plt.ax, boxes_3d_p2, colors='b')
+
+    def draw_detection(self, detection_anno, label_color=GLColor.Blue):
+        if self.kitti_info is None:
+            self.error("you must load infos and choose a existing image idx first.")
+            return
+
+        dt_box_color = self.w_config.get("DTBoxColor")[:3]
+        dt_box_color = (*dt_box_color, self.w_config.get("DTBoxAlpha"))
+
+        pc_info = self.kitti_info["point_cloud"]
+        calib = self.kitti_info["calib"]
+        rect = calib['R0_rect']
+        P2 = calib['P2']
+        Trv2c = calib['Tr_velo_to_cam']
+        # detection_anno = kitti.remove_low_height(detection_anno, 25)
+        detection_anno = kitti.remove_low_score(detection_anno, self.w_config.get("DTScoreThreshold"))
         
+        dt_bboxes = detection_anno["bbox"]
+        
+        dt_boxes_corners, scores, dt_box_lidar = kitti_anno_to_corners(
+            self.kitti_info, detection_anno)
+        print("DEBUG", dt_box_lidar)
+        print("DEBUG Scores", scores)
+        if self.gt_boxes is not None:
+            iou = _riou3d_shapely(self.gt_boxes, dt_box_lidar)
+            if iou.shape[0] != 0:
+                dt_to_gt_box_iou = iou.max(0)
+            else:
+                dt_to_gt_box_iou = np.zeros([0, 0])
+        num_dt = dt_box_lidar.shape[0]
+        dt_boxes_corners_cam = box_np_ops.lidar_to_camera(
+            dt_boxes_corners, rect, Trv2c)
+        dt_boxes_corners_cam = dt_boxes_corners_cam.reshape((-1, 3))
+        dt_boxes_corners_cam_p2 = box_np_ops.project_to_image(
+            dt_boxes_corners_cam, P2)
+        dt_boxes_corners_cam_p2 = dt_boxes_corners_cam_p2.reshape([-1, 8, 2])
+        dt_labels = detection_anno["name"]
+
+        dt_scores_text = None
+        if scores is not None:
+            if self.gt_boxes is not None:
+                dt_scores_text = [
+                    f'score={s:.2f}, iou={i:.2f}'
+                    for s, i in zip(scores, dt_to_gt_box_iou)
+                ]
+            else:
+                dt_scores_text = [
+                    f'score={s:.2f}, z={z:.2f}'
+                    for s, z in zip(scores, dt_box_lidar[:, 2])
+                ]
+            if self.w_config.get("DrawDTLabels"):
+                self.w_pc_viewer.labels("dt_boxes/labels",
+                                        dt_boxes_corners[:, 1, :], dt_scores_text,
+                                        label_color, 15)
+        dt_box_color = np.tile(np.array(dt_box_color)[np.newaxis, ...], [num_dt, 1])
+        if self.w_config.get("DTScoreAsAlpha") and scores is not None:
+            dt_box_color = np.concatenate([dt_box_color[:, :3], scores[..., np.newaxis]], axis=1)
+        self.w_pc_viewer.boxes3d("dt_boxes", dt_boxes_corners, dt_box_color,
+                                 self.w_config.get("DTBoxLineWidth"), 1.0)
+
+    def plot_gt_boxes_in_pointcloud(self):
+        if self.kitti_info is None:
+            self.error("you must load infos and choose a existing image idx first.")
+            return
+        if 'annos' in self.kitti_info:
+            gt_box_color = self.w_config.get("GTBoxColor")[:3]
+            gt_box_color = (*gt_box_color, self.w_config.get("GTBoxAlpha"))
+            diff = self.difficulty.tolist()
+            diff_to_name = {-1: "unk", 0: "easy", 1: "moderate", 2: "hard"}
+            diff_names = [diff_to_name[d] for d in diff]
+            label_idx = list(range(self.gt_names.shape[0]))
+            labels_ = [
+                f'{i}:{l}, {d}'
+                for i, l, d in zip(label_idx, self.gt_names, diff_names)
+            ]
+            boxes_corners = box_np_ops.center_to_corner_box3d(
+                self.gt_boxes[:, :3],
+                self.gt_boxes[:, 3:6],
+                self.gt_boxes[:, 6],
+                origin=[0.5, 0.5, 0.5],
+                axis=2)
+            # print(self.gt_boxes[:, 6])
+            # print(self.gt_boxes[:, :3])
+            self.w_pc_viewer.boxes3d("gt_boxes", boxes_corners, gt_box_color,
+                                     3.0, 1.0)
+            if self.w_config.get("DrawGTLabels"):
+                self.w_pc_viewer.labels("gt_boxes/labels", boxes_corners[:, 0, :],
+                                        labels_, GLColor.Green, 15)
+
+    def plot_pointcloud(self):
+        if self.kitti_info is None:
+            self.error("you must load infos and choose a existing image idx first.")
+            return
+        pc_info = self.kitti_info["point_cloud"]
+        image_info = self.kitti_info["image"]
+
+        point_color = self.w_config.get("PointColor")[:3]
+        point_color = (*point_color, self.w_config.get("PointAlpha"))
+        point_color = np.tile(np.array(point_color), [self.points.shape[0], 1])
+
+        # self.w_pc_viewer.reset_camera()
+        point_size = np.full(
+            [self.points.shape[0]],
+            self.w_config.get("PointSize"),
+            dtype=np.float32)
+        # self.w_pc_viewer.draw_point_cloud(self.points, color=points_rgb, with_reflectivity=False, size=0.1)
+        # self.w_pc_viewer.draw_bounding_box()
+        idx = self.image_idxes.index(image_info["image_idx"])
+        if 'annos' in self.kitti_info:
+            # poses = np.zeros([self.gt_boxes.shape[0], 3])
+            # self.w_pc_viewer.circles(
+            #     "circles", poses, np.linalg.norm(
+            #         self.gt_boxes[:, :3], axis=-1))
+            # self.w_pc_viewer.draw_anchors_trunk(
+            #     self.gt_boxes, self.points, gt_names=gt_names)
+            # self.w_pc_viewer.draw_anchors_v1(
+            #     self.gt_boxes, self.points, gt_names=gt_names)
+            # self.w_pc_viewer.draw_frustum(bboxes, rect, Trv2c, P2)
+            # self.w_pc_viewer.draw_cropped_frustum(bboxes, rect, Trv2c, P2)
+            gt_point_mask = box_np_ops.points_in_rbbox(self.points,
+                                                       self.gt_boxes).any(1)
+            point_size[gt_point_mask] = self.w_config.get("GTPointSize")
+            gt_point_color = self.w_config.get("GTPointColor")
+            gt_point_color = (*gt_point_color[:3],
+                              self.w_config.get("GTPointAlpha"))
+            point_color[gt_point_mask] = gt_point_color
+        self.w_pc_viewer.remove("dt_boxes/labels")
+        self.w_pc_viewer.remove("dt_boxes")
+        if self.detection_annos is not None and self.w_config.get("DrawDTBoxes"):
+            detection_anno = self.detection_annos[idx]
+            self.draw_detection(detection_anno)
+        if self.w_config.get("WithReflectivity"):
+            if self.points.shape[1] < 4:
+                self.error("Your pointcloud don't contain reflectivity.")
+            else:
+                point_color = np.concatenate(
+                    [point_color[:, :3], self.points[:, 3:4] * 0.8 + 0.2],
+                    axis=1)
+
+        self.w_pc_viewer.scatter(
+            "pointcloud", self.points[:, :3], point_color, size=point_size)
+        """
+        coors_range = np.array(self.w_config.get("CoorsRange"), dtype=np.float32)
+        bv_range = coors_range[[0, 1, 3, 4]]
+        voxel_size = np.array(self.w_config.get("VoxelSize"), dtype=np.float32)
+        grid_size = (coors_range[3:] - coors_range[:3]) / voxel_size
+        grid_size = np.round(grid_size).astype(np.int64)
+
+        foo_map_size = grid_size[:2]
+        # foo_map_size = [200, 200]
+        x = np.arange(foo_map_size[0])
+        y = np.arange(foo_map_size[1])
+        shift = coors_range[:2]
+        x = x * voxel_size[0] + shift[0] + 0.5 * voxel_size[0]
+        y = y * voxel_size[1] + shift[1] + 0.5 * voxel_size[1]
+        xy1, xy2 = np.meshgrid(x, y)
+        
+        def gaussian2d(x, y, A, ux=0, uy=0, stdx=1, stdy=1):
+            return A * np.exp(-0.5 * ((x - ux) / stdx) ** 2 - 0.5 * ((y - uy) / stdy) ** 2)
+        z = gaussian2d(xy1, xy2, 0, 0, 2, 2) - 20
+        self.w_pc_viewer.surface("test", x, y, z, GLColor.Purple, 0.5)
+        """
+
+    def load_info(self, image_idx):
+        if self.kitti_infos is None:
+            self.error("you must load infos first.")
+            return
+
+        if image_idx not in self.image_idxes:
+            self.error(f"index{image_idx} not exist.")
+            return False
+        self.json_setting.set("image_idx", str(image_idx))
+        idx = self.image_idxes.index(image_idx)
+        self.kitti_info = self.kitti_infos[idx]
+        pc_info = self.kitti_info["point_cloud"]
+        image_info = self.kitti_info["image"]
+        calib = self.kitti_info["calib"]
+        if "timestamp" in self.kitti_info:
+            self.message("timestamp", self.kitti_info["timestamp"])
+        image = None
+        if 'image_path' in image_info:
+            img_path = image_info['image_path']
+            if img_path != "":
+                image = io.imread(str(self.root_path / img_path))
+                self.current_image = image
+
+            else:
+                self.current_image = None
+        else:
+            self.current_image = None
+        v_path = str(self.root_path / pc_info['velodyne_path'])
+        num_features = 4
+        if 'num_features' in pc_info:
+            num_features = pc_info['num_features']
+
+        points = np.fromfile(
+            v_path, dtype=np.float32, count=-1).reshape([-1, num_features])
+        self.points = points
+        rect = calib['R0_rect'].astype(np.float32)
+        Trv2c = calib['Tr_velo_to_cam'].astype(np.float32)
+        P2 = calib['P2'].astype(np.float32)
+        image_shape = None
+        if 'image_shape' in image_info:
+            image_shape = image_info['image_shape']
+            # self.info("num_points before remove:", self.points.shape[0])
+            if self.w_config.get("RemoveOutsidePoint"):
+                self.points = box_np_ops.remove_outside_points(
+                    self.points, rect, Trv2c, P2, image_shape)
+            # self.info("num_points after remove:", self.points.shape[0])
+        img_path = self.w_image_save_path.text()
+        img_path = str(Path(img_path).parent / f"{image_idx}.jpg")
+        self.w_image_save_path.setText(img_path)
+        self.json_setting.set("save_image_path", img_path)
+
+        if 'annos' in self.kitti_info:
+            annos = self.kitti_info['annos']
+            # annos = kitti.filter_kitti_anno(annos,
+            #                                 self.w_config.get("UsedClass"))
+            labels = annos['name']
+            num_obj = len([n for n in annos['name'] if n != 'DontCare'])
+            # print(annos["group_ids"].shape)
+            dims = annos['dimensions'][:num_obj]
+            loc = annos['location'][:num_obj]
+            rots = annos['rotation_y'][:num_obj]
+            self.difficulty = annos["difficulty"][:num_obj]
+            self.gt_names = labels[:num_obj]
+            gt_boxes_camera = np.concatenate(
+                [loc, dims, rots[..., np.newaxis]], axis=1)
+            self.gt_boxes = box_np_ops.box_camera_to_lidar(
+                gt_boxes_camera, rect, Trv2c)
+            box_np_ops.change_box3d_center_(self.gt_boxes, [0.5, 0.5, 0], [0.5, 0.5, 0.5])
+            if 'group_ids' in annos:
+                self.group_ids = annos['group_ids'][:num_obj]
+        if self.w_config.get("EnableSample"):
+            self.sample_to_current_data()
+        if self.w_config.get("EnableAugmentation"):
+            self.data_augmentation()
+
+    def plot_image(self):
+        if self.kitti_info is None:
+            self.error("you need to load the info first before plot image")
+            return False
+        if self.current_image is not None:
+            self.w_plt.ax.imshow(self.current_image)
+            if 'annos' in self.kitti_info:
+                annos = self.kitti_info['annos']
+                annos = kitti.filter_kitti_anno(annos,
+                                                self.w_config.get("UsedClass"))
+                print("DEBUG", self.w_config.get("UsedClass"))
+                print("DEBUG", len(annos['name']))
+                labels = annos['name']
+                num_obj = len([n for n in annos['name'] if n != 'DontCare'])
+                bbox_plot.draw_bbox_in_ax(
+                    self.w_plt.ax,
+                    annos['bbox'],
+                    edgecolors=['g'] * num_obj + ['b'] * num_obj,
+                    labels=[f'{i}: {labels[i]}' for i in range(len(labels))])
+
+    def plot_all(self, image_idx):
+        self.w_plt.reset_plot()
+        self.load_info(image_idx)
+        self.plot_image()
+        self.draw_gt_in_image()
+        self.w_plt.draw()  # this isn't supported in ubuntu.
+        self.plot_pointcloud()
+        if self.w_config.get("DrawGTBoxes"):
+            self.plot_gt_boxes_in_pointcloud()
+        if self.w_config.get("DrawVoxels"):
+            self.w_pc_viewer.draw_voxels(self.points, self.gt_boxes)
+
+        return True
+
+    def on_plotButtonPressed(self):
+        if self.kitti_infos is None:
+            self.error("you must load Kitti Infos first.")
+            return
+        image_idx = int(self.w_imgidx.text())
+        if self.plot_all(image_idx):
+            self.current_idx = self.image_idxes.index(image_idx)
+
+    def on_plotAllButtonPressed(self):
+        for idx in self.image_idxes:
+            self.plot_all(idx)
+            self.update()
+            self.w_pc_viewer.updateGL()
+            p = self.w_pc_viewer.grabFrameBuffer()
+            img_path = self.w_image_save_path.text()
+            img_path = str(Path(img_path).parent / f"{idx}.jpg")
+            p.save(img_path, 'jpg', 100)
+            self.info("image saved to", img_path)
+            print("image saved to", img_path)
+
+    def closeEvent(self, event):
+        config_str = self.w_config.dumps()
+        self.json_setting.set("config", config_str)
+        return super().closeEvent(event)
+
+    def on_configchanged(self, msg):
+        # self.warning(msg.name, msg.value)
+        # save config to file
+        idx = self.image_idxes.index(self.kitti_info["image"]["image_idx"])
+        config_str = self.w_config.dumps()
+        self.json_setting.set("config", config_str)
+        pc_redraw_msgs = ["PointSize", "PointAlpha", "GTPointSize"]
+        pc_redraw_msgs += ["GTPointAlpha", "WithReflectivity"]
+        pc_redraw_msgs += ["PointColor", "GTPointColor"]
+        box_redraw = ["GTBoxColor", "GTBoxAlpha"]
+        dt_redraw = ["DTBoxColor", "DTBoxAlpha", "DrawDTLabels", "DTScoreAsAlpha", "DTScoreThreshold", "DTBoxLineWidth"]
+
+        vx_redraw_msgs = ["DrawPositiveVoxelsOnly", "DrawVoxels"]
+        vx_redraw_msgs += ["PosVoxelColor", "PosVoxelAlpha"]
+        vx_redraw_msgs += ["NegVoxelColor", "NegVoxelAlpha"]
+        all_redraw_msgs = ["RemoveOutsidePoint"]
+        if msg.name in vx_redraw_msgs:
+            if self.w_config.get("DrawVoxels"):
+                self.w_pc_viewer.draw_voxels(self.points, self.gt_boxes)
+            else:
+                self.w_pc_viewer.remove("voxels")
+        elif msg.name in pc_redraw_msgs:
+            self.plot_pointcloud()
+        elif msg.name in all_redraw_msgs:
+            self.on_plotButtonPressed()
+        elif msg.name in box_redraw:
+            self.plot_gt_boxes_in_pointcloud()
+        elif msg.name in dt_redraw:
+            if self.detection_annos is not None and self.w_config.get("DrawDTBoxes"):
+                detection_anno = self.detection_annos[idx]
+                self.draw_detection(detection_anno)
+
+    def on_loadVxNetCkptPressed(self):
+        ckpt_path = Path(self.w_vckpt_path.text())
+        self.json_setting.set("latest_vxnet_ckpt_path",
+                              self.w_vckpt_path.text())
+        self.inference_ctx.restore(ckpt_path)
+        # self.w_load_ckpt.setText(self.w_load_ckpt.text() + f": {ckpt_path.stem}")
+        self.info("load VoxelNet ckpt succeed.")
+
+    def on_BuildVxNetPressed(self):
+        if self.w_config.get("TensorflowInference"):
+            self.inference_ctx = TFInferenceContext()
+        else:
+            self.inference_ctx = TorchInferenceContext()
+        vconfig_path = Path(self.w_vconfig_path.text())
+        self.inference_ctx.build(vconfig_path)
+        self.json_setting.set("latest_vxnet_cfg_path", str(vconfig_path))
+        self.info("Build VoxelNet ckpt succeed.")
+        # self.w_load_config.setText(self.w_load_config.text() + f": {vconfig_path.stem}")
+
+    def on_InferenceVxNetPressed(self):
+        t = time.time()
+        inputs = self.inference_ctx.get_inference_input_dict(
+            self.kitti_info, self.points)
+        self.info("input preparation time:", time.time() - t)
+        t = time.time()
+        with self.inference_ctx.ctx():
+            det_annos = self.inference_ctx.inference(inputs)
+        self.info("detection time:", time.time() - t)
+        self.draw_detection(det_annos[0])
+
+    def on_LoadInferenceVxNetPressed(self):
+        self.on_BuildVxNetPressed()
+        self.on_loadVxNetCkptPressed()
+        self.on_InferenceVxNetPressed()
+
+    def on_EvalVxNetPressed(self):
+        if "annos" not in self.kitti_infos[0]:
+            self.error("ERROR: infos don't contain gt label.")
+        t = time.time()
+        det_annos = []
+        input_cfg = self.inference_ctx.config.eval_input_reader
+        model_cfg = self.inference_ctx.config.model.second
+
+        class_names = list(input_cfg.class_names)
+        num_features = model_cfg.num_point_features
+        with self.inference_ctx.ctx():
+            for info in list_bar(self.kitti_infos):
+                v_path = self.root_path / info['velodyne_path']
+                # v_path = v_path.parent.parent / (
+                #     v_path.parent.stem + "_reduced") / v_path.name
+                points = np.fromfile(
+                    str(v_path), dtype=np.float32,
+                    count=-1).reshape([-1, num_features])
+                rect = info['calib/R0_rect']
+                P2 = info['calib/P2']
+                Trv2c = info['calib/Tr_velo_to_cam']
+                image_shape = info['img_shape']
+                if self.w_config.get("RemoveOutsidePoint"):
+                    points = box_np_ops.remove_outside_points(
+                        points, rect, Trv2c, P2, image_shape)
+                inputs = self.inference_ctx.get_inference_input_dict(
+                    info, points)
+                det_annos += self.inference_ctx.inference(inputs)
+        self.info("total detection time:", time.time() - t)
+        gt_annos = [i["annos"] for i in self.kitti_infos]
+        self.info(get_official_eval_result(gt_annos, det_annos, class_names))
+
+    @staticmethod
+    def get_simpify_labels(labels):
+        label_map = {
+            "Car": "V",
+            "Pedestrian": "P",
+            "Cyclist": "C",
+            "car": "C",
+            "tractor": "T1",
+            "trailer": "T2",
+        }
+        label_count = {
+            "Car": 0,
+            "Pedestrian": 0,
+            "Cyclist": 0,
+            "car": 0,
+            "tractor": 0,
+            "trailer": 0,
+        }
+        ret = []
+        for i, name in enumerate(labels):
+            count = 0
+            if name in label_count:
+                count = label_count[name]
+                label_count[name] += 1
+            else:
+                label_count[name] = 0
+            ret.append(f"{label_map[name]}{count}")
+        return ret
+
+    @staticmethod
+    def get_false_pos_neg(gt_boxes, dt_boxes, labels, fp_thresh=0.1):
+        iou = _riou3d_shapely(gt_boxes, dt_boxes)
+        ret = np.full([len(gt_boxes)], 2, dtype=np.int64)
+        assigned_dt = np.zeros([len(dt_boxes)], dtype=np.bool_)
+        label_thresh_map = {
+            "Car": 0.7,
+            "Pedestrian": 0.5,
+            "Cyclist": 0.5,
+            "car": 0.7,
+            "tractor": 0.7,
+            "trailer": 0.7,
+        }
+        tp_thresh = np.array([label_thresh_map[n] for n in labels])
+        if len(gt_boxes) != 0 and len(dt_boxes) != 0:
+            iou_max_dt_for_gt = iou.max(1)
+            dt_iou_max_dt_for_gt = iou.argmax(1)
+            ret[iou_max_dt_for_gt >= tp_thresh] = 0
+            ret[np.logical_and(iou_max_dt_for_gt < tp_thresh,
+                               iou_max_dt_for_gt > fp_thresh)] = 1  # FP
+            assigned_dt_inds = dt_iou_max_dt_for_gt
+            assigned_dt_inds = assigned_dt_inds[iou_max_dt_for_gt >= fp_thresh]
+            assigned_dt[assigned_dt_inds] = True
+        return ret, assigned_dt
+
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    print("++++++????")
+    ex = KittiViewer()
+    print(ex.kitti_info)
+    sys.exit(app.exec_())
